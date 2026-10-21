@@ -54,6 +54,10 @@ namespace Narcotics
                 // A narcotics case is already running: skip this murder so no parallel case spawns (vanilla also runs
                 // one murder case at a time). The game re-fires while our op (not a murder) is active, hence the log.
                 if (Operation.Active) { SkipLog("a narcotics case is already active"); return false; }
+                // The case board may already contain a saved narcotics case while its managed
+                // operation is being reconstructed. Never overwrite it with a new operation.
+                if (InvestigationPersistence.Loading || InvestigationPersistence.HasUnresolvedCase())
+                { SkipLog("saved narcotics investigation pending restoration"); return false; }
 
                 // Leave sniper/kidnap to vanilla / other mods - we only ever replace ORDINARY murders.
                 bool ordinaryMurder = true;

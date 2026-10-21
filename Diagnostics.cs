@@ -538,6 +538,7 @@ namespace Narcotics
         {
             try
             {
+                InvestigationPersistence.Tick(); // reattach saved case/operation BEFORE any auto-start
                 Operation.TickAutoStart();   // proactive auto-start when HijackChance=1.0 (doesn't wait for a vanilla case)
                 Operation.TickPendingStrip();   // finish a deferred lab-furniture strip once the old lab is back in view; cheap no-op otherwise
                 Operation.Tick();   // real operation logic (cook pin re-assert); cheap no-op when inactive
@@ -802,7 +803,11 @@ namespace Narcotics
                 DrugItem.ResetOnLoad();
                 Dose.ResetOnLoad();
                 Herd.ReleaseAll();
-                NarcoticsPlugin.Log.LogInfo("[Narcotics] game started/loaded - operation state reset.");
+                // The prefix restores presets before evidence loading; after ResetOnLoad, rebind their names.
+                // This restores item identity only, not the active cook/dealer/operation state.
+                DrugPersistence.RestorePresets();
+                InvestigationPersistence.AfterGameStarted();
+                NarcoticsPlugin.Log.LogInfo("[Narcotics] game started/loaded - operation state reset; saved investigations will be reattached before another operation starts.");
             }
             catch { }
         }

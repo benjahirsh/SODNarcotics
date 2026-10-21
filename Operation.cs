@@ -20,7 +20,7 @@ namespace Narcotics
     internal static class Operation
     {
         internal sealed class Dist { public Human H; public bool Collected; }
-        internal sealed class Dealer { public Human H; public int DistIndex; public FurnitureLocation Container; public NewNode Drop; public NewGameLocation DropLoc; public IntPtr DropCam; public readonly List<Interactable> Stash = new List<Interactable>(); public int BinDoses; public bool Stocked; public float NextSell; }   // DropCam = the camera Interactable pointer that films the dead drop, so the DEAL can pick a DIFFERENT camera. NextSell = game-hours gate: the dealer potters freely until then, then sells one dose to the nearest passer-by at a filmed node.
+        internal sealed class Dealer { public Human H; public int DistIndex; public FurnitureLocation Container; public NewNode Drop; public NewGameLocation DropLoc; public IntPtr DropCam; public readonly List<Interactable> Stash = new List<Interactable>(); public int BinDoses; public float NextSell; }   // DropCam = the camera Interactable pointer that films the dead drop, so the DEAL can pick a DIFFERENT camera. NextSell = game-hours gate: the dealer potters freely until then, then sells one dose to the nearest passer-by at a filmed node.
 
         internal static bool Active;
         internal static Human CookHuman;
@@ -65,16 +65,28 @@ namespace Narcotics
         private static float _opStartGT;        // game hours when THIS case initialised; re-cook sessions anchor to it (opStart + N*CookIntervalHours)
         private static bool _cookActive;        // a lab session is in progress (cook staying)
         private static int _cookBatchesLeft;    // batches still to make this session
+        private static int _cookBatchLimit;     // ceiling captured when the current session was initialized
+        private static float _cookShiftHours;   // stable per-operation shift duration
+        private static float _cookIntervalHours; // stable per-operation cadence
         private static float _nextSellScan;     // real-time seconds; throttle the passer-by scan
         private static bool _forceSale;         // F4: make a dealer sell now (bypass the interval + scan throttle)
         private static float _nextAutoStartTry; // real-time seconds; throttle the proactive auto-start retry
+        private static float _stalledSchedulerLoggedForEndGT = -1f; // one fallback diagnostic per resolved operation
         private static float _lastOpEndGT;      // game hours when the last op ended; the next case waits to the next 12h grid point after it
         private static NewNode _targetNode;     // where the active mover is headed (for the distance readout)
         private static NewNode _labNode;        // cached stable node inside the lab (see LabNode)
         private static NewNode _cookPotter;     // the lab node the cook is currently pottering to (rotated, so they pace while cooking)
         private static float _cookNextPotter;   // real-time seconds; when to pick a new cook potter node
+        // Trace resumed in-flight navigation without affecting inventories or world objects.
+        private static bool _resumeCookTravelTrace;
+        private static float _resumeCookTravelLogAfter;
         private static bool _labDosesPlaced;    // discoverable doses seeded in the lab yet (so the player finds a stash, not just 1)
         private static readonly List<Interactable> _labDiscoveryDoses = new List<Interactable>();   // extra lab doses for the player to find - NOT part of the pull chain (kept out of LabStash so cadence is unchanged)
+        private static readonly List<SavedLabDiscoveryDose> _labDiscoveryOriginalPlaces = new List<SavedLabDiscoveryDose>();
+        private static bool _labDiscoveryNeedsExactRestore;
+        // The exact-placement pass restores Interactable metadata; after lab streaming,
+        // native Unity visuals sometimes still need to be instantiated from that SAME object.
+        private static bool _labDiscoveryVisualPassPending;
 
         // Overdose cadence: a buyer overdoses a few minutes after a purchase, triggering the enforcer arrest. The
         // FIRST overdose opens the player's case; later ones add a new "search" lead to the SAME case (serial-style,
@@ -112,6 +124,11 @@ namespace Narcotics
             try
             {
                 if (Active) { Log("an operation is already active; stop it first."); return false; }
+                if (InvestigationPersistence.Loading || InvestigationPersistence.HasUnresolvedCase())
+                {
+                    Log("saved narcotics investigation exists or is loading; refusing to replace its operation.");
+                    return false;
+                }
                 Human cook = PickCook();
                 if (cook == null) { Log("could not find a suitable cook."); return false; }
                 NewAddress lab = LabSiting.PickLab(cook, out _);
@@ -127,9 +144,12 @@ namespace Narcotics
                 Log($"operation drug = '{DrugName}'; case title = '{CaseTitle}'.");
 
                 CookHuman = cook; Lab = lab; Active = true;
-                _labDressed = false; _nextDressTry = 0f; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;   // fresh lab dressing/doses/cook-potter for this op
+                _labDressed = false; _nextDressTry = 0f; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _labDiscoveryOriginalPlaces.Clear(); _labDiscoveryNeedsExactRestore = false; _labDiscoveryVisualPassPending = false; _cookPotter = null; _cookNextPotter = 0f;   // fresh lab dressing/doses/cook-potter for this op
                 ResetJob();
-                _opStartGT = Herd.NowHours();      // case init: re-cook sessions anchor to this (opStart + 12h, +24h, ...)
+                _opStartGT = Herd.NowHours();      // case init: re-cook sessions anchor to this (opStart + N*interval)
+                _cookIntervalHours = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
+                _cookShiftHours = Math.Max(0.1f, NarcoticsConfig.CookShiftHours);
+                _cookBatchLimit = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
                 _nextCookTime = Herd.NowHours();   // cook heads to the lab right away on the first day
                 LabStash.Clear();
 
@@ -290,7 +310,7 @@ namespace Narcotics
         // case once it is solved), and the quiet after a case is "whatever time is left in the current 12h cycle".
         private static float NextGridPoint(float afterHours)
         {
-            float iv = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
+            float iv = Math.Max(0.1f, _cookIntervalHours > 0f ? _cookIntervalHours : NarcoticsConfig.CookIntervalHours);
             float next = _opStartGT + iv;
             for (int guard = 0; next <= afterHours && guard < 100000; guard++) next += iv;
             return next;
@@ -311,7 +331,7 @@ namespace Narcotics
             catch (Exception e) { Log($"TickPendingStrip error: {e.Message}"); }
         }
 
-        internal static void Stop()
+        internal static void Stop(bool preserveSolvedCaseEvidence = false)
         {
             try
             {
@@ -326,12 +346,214 @@ namespace Narcotics
                 _lastOpEndGT = Herd.NowHours();     // the next proactive auto-start waits ~CookIntervalHours after this
                 if (_mover != null) Herd.Release(_mover);
                 Herd.ReleaseAll();
-                Dose.DestroyAll();
-                DestroyWorldDoses();
-                Log($"STOPPED (cook {NarcoticsPlugin.Name(CookHuman)} + crew released, doses cleared).");
+                // The solved case keeps its evidence cards. Their image lookup depends on the source interactables, so
+                // leave those objects in the save while still clearing all operation state in ClearState().
+                if (!preserveSolvedCaseEvidence)
+                {
+                    Dose.DestroyAll();
+                    DestroyWorldDoses();
+                }
+                Log($"STOPPED (cook {NarcoticsPlugin.Name(CookHuman)} + crew released, doses {(preserveSolvedCaseEvidence ? "retained for solved-case evidence" : "cleared")}).");
             }
             catch (Exception e) { Log($"Stop error: {e.Message}"); }
             finally { ClearState(); }
+        }
+
+        // Snapshot immutable identities, NOT engine objects or Il2Cpp pointers. Live stock/delivery
+        // state is owned by the loaded game and deliberately not recreated by spawning new items.
+        internal static SavedInvestigation CaptureIdentity()
+        {
+            try
+            {
+                if (!Active || CookHuman == null || Lab == null || string.IsNullOrEmpty(DrugItem.CurrentKey)) return null;
+                int labIndex;
+                if (!int.TryParse(LabDirIndex(), out labIndex)) return null;
+                var record = new SavedInvestigation
+                {
+                    DrugKey = DrugItem.CurrentKey,
+                    DrugName = DrugName,
+                    CaseTitle = CaseTitle,
+                    BasePresetName = DrugItem.BasePreset != null ? DrugItem.BasePreset.presetName : null,
+                    CookId = CookHuman.humanID,
+                    LabDirectoryIndex = labIndex,
+                    LabName = Lab.name,
+                    StartedAtGameHours = _opStartGT
+                };
+                for (int i = 0; i < Distributors.Count; i++)
+                {
+                    var dist = Distributors[i];
+                    if (dist == null || dist.H == null) return null;
+                    record.DistributorIds.Add(dist.H.humanID);
+                }
+                for (int i = 0; i < Dealers.Count; i++)
+                {
+                    var d = Dealers[i]; if (d == null || d.H == null || d.Container == null) return null;
+                    var node = Containers.ContainerNode(d.Container);
+                    if (node == null) return null;
+                    var position = node.position;
+                    record.Dealers.Add(new SavedDealerSite {
+                        HumanId = d.H.humanID,
+                        DistributorIndex = d.DistIndex,
+                        FurnitureName = d.Container.furniture != null ? d.Container.furniture.name : null,
+                        X = position.x, Y = position.y, Z = position.z
+                    });
+                }
+                if (record.DistributorIds.Count == 0 || record.Dealers.Count == 0 ||
+                    string.IsNullOrEmpty(record.BasePresetName)) return null;
+                return record;
+            }
+            catch (Exception e) { Log($"CaptureIdentity failed: {e.Message}"); return null; }
+        }
+
+        private static Human ResolveSavedHuman(int humanId)
+        {
+            try
+            {
+                var cd = CityData.Instance;
+                var citizens = cd != null ? cd.citizenDirectory : null;
+                if (citizens == null) return null;
+                for (int i = 0; i < citizens.Count; i++)
+                {
+                    var person = citizens[i];
+                    if (person != null && person.humanID == humanId) return person;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // Rebinds stable operation identities and saved world state without replaying in-flight jobs,
+        // which could duplicate a deposit, overdose, or sale after loading.
+        internal static bool RestoreIdentity(SavedInvestigation saved)
+        {
+            try
+            {
+                if (Active || saved == null || saved.DistributorIds == null || saved.Dealers == null ||
+                    saved.DistributorIds.Count == 0 || saved.Dealers.Count == 0) return false;
+                var city = CityData.Instance;
+                var locations = city != null ? city.gameLocationDirectory : null;
+                if (locations == null || saved.LabDirectoryIndex < 0 ||
+                    saved.LabDirectoryIndex >= locations.Count) return false;
+                var location = locations[saved.LabDirectoryIndex];
+                var lab = location != null ? location.TryCast<NewAddress>() : null;
+                if (lab == null || lab.name != saved.LabName) return false;
+                var cook = ResolveSavedHuman(saved.CookId);
+                if (cook == null) return false;
+
+                var restoredDist = new List<Dist>();
+                for (int i = 0; i < saved.DistributorIds.Count; i++)
+                {
+                    var h = ResolveSavedHuman(saved.DistributorIds[i]);
+                    if (h == null) return false;
+                    restoredDist.Add(new Dist { H = h });
+                }
+
+                // Locate the SAME physical containers, not randomly picked new ones. Saved world
+                // positions + furniture preset names disambiguate nearby dumpsters of the same type.
+                var candidates = Containers.SiteContainersNearLab(lab,
+                    Math.Max(24, saved.Dealers.Count * 12));
+                var restoredDealers = new List<Dealer>();
+                var used = new HashSet<IntPtr>();
+                for (int i = 0; i < saved.Dealers.Count; i++)
+                {
+                    var sd = saved.Dealers[i];
+                    var h = ResolveSavedHuman(sd.HumanId);
+                    if (h == null || sd.DistributorIndex < 0 || sd.DistributorIndex >= restoredDist.Count) return false;
+                    FurnitureLocation bin = null;
+                    NewNode drop = null;
+                    float best = 0.25f; // <= 0.5m error in stable world-node coordinates
+                    for (int k = 0; k < candidates.Count; k++)
+                    {
+                        var c = candidates[k]; if (c == null || used.Contains(c.Pointer)) continue;
+                        var n = Containers.ContainerNode(c); if (n == null) continue;
+                        string furniture = c.furniture != null ? c.furniture.name : null;
+                        if (furniture != sd.FurnitureName) continue;
+                        var p = n.position;
+                        float dx = p.x - sd.X, dy = p.y - sd.Y, dz = p.z - sd.Z;
+                        float dist2 = dx * dx + dy * dy + dz * dz;
+                        if (dist2 < best) { best = dist2; bin = c; drop = n; }
+                    }
+                    if (bin == null || !Dose.CanDeposit(bin))
+                    {
+                        Log($"[resume] cannot uniquely reconnect {NarcoticsPlugin.Name(h)}'s original dead drop; will retry.");
+                        return false;
+                    }
+                    used.Add(bin.Pointer);
+                    var dealer = new Dealer { H = h, DistIndex = sd.DistributorIndex,
+                        Container = bin, Drop = drop, DropLoc = drop.gameLocation,
+                        NextSell = Herd.NowHours() + Math.Max(0.1f, NarcoticsConfig.DealerSellIntervalHours) };
+                    IntPtr camera = IntPtr.Zero; float angle, eye;
+                    CameraFrameScore(drop, IntPtr.Zero, out camera, out angle, out eye);
+                    dealer.DropCam = camera;
+                    restoredDealers.Add(dealer);
+                }
+
+                var presets = Toolbox.Instance != null ? Toolbox.Instance.objectPresetDictionary : null;
+                InteractablePreset basePreset = null;
+                if (presets == null || !presets.TryGetValue(saved.BasePresetName, out basePreset) || basePreset == null)
+                    return false;
+                var activeDrug = DrugItem.CreateDrug(saved.DrugKey, saved.DrugName, basePreset,
+                    makeCurrent: true, persist: false);
+                if (activeDrug == null) return false;
+
+                // All required references validated above: only now commit the new runtime operation.
+                CookHuman = cook;
+                Lab = lab;
+                DrugName = saved.DrugName;
+                CaseTitle = saved.CaseTitle;
+                Distributors.Clear(); Distributors.AddRange(restoredDist);
+                Dealers.Clear(); Dealers.AddRange(restoredDealers);
+                Buyers.Clear(); LabStash.Clear();
+                ResetJob();
+                _opStartGT = saved.StartedAtGameHours;
+                if (_opStartGT <= 0f || _opStartGT > Herd.NowHours()) _opStartGT = Herd.NowHours();
+                _cookIntervalHours = Math.Max(0.1f, NarcoticsConfig.CookIntervalHours);
+                _cookShiftHours = Math.Max(0.1f, NarcoticsConfig.CookShiftHours);
+                _cookBatchLimit = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
+                _nextCookTime = NextGridPoint(Herd.NowHours()); // legacy fallback until a matching per-save snapshot is found
+                _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0;
+                _odBuyerId = -1; _odQueue.Clear(); _odNextEligible = Herd.NowHours();
+                _labDressed = true;        // avoid creating duplicate lab equipment
+                _labDosesPlaced = true;    // legacy default: never duplicate evidence on an old save
+                _labDiscoveryDoses.Clear();
+                _labDiscoveryOriginalPlaces.Clear();
+                _labDiscoveryNeedsExactRestore = false;
+                _labDiscoveryVisualPassPending = false;
+                // Rebuild only our managed index of existing active-drug items held by humans.
+                // The game world is authoritative; never recreate doses to match a saved count.
+                int reboundInventory = Dose.ReindexSavedInventory(saved.DrugKey);
+                foreach (var dealer in Dealers)
+                {
+                    if (dealer != null && dealer.Container != null)
+                        dealer.BinDoses = Dose.CountInBin(dealer.Container);
+                }
+                _lastOpEndGT = 0f;
+                Active = true;
+                var cookSnapshot = InvestigationPersistence.FindCookSession(saved, out var cookSkipReason, out var rejectedCookSnapshot);
+                if (cookSnapshot == null)
+                {
+                    var rejected = rejectedCookSnapshot;
+                    LogCookResumeSkipped(cookSkipReason ?? "matching snapshot unavailable", rejected != null ? rejected.CapturedAtGameHours : Herd.NowHours(), rejected != null && rejected.CookActive, rejected != null ? rejected.CookSessionStartGameHours : -1f, rejected != null ? rejected.CookBatchesLeft : 0, rejected != null ? rejected.CookShiftHours : 0f, rejected != null ? rejected.NextCookAtGameHours : -1f);
+                }
+                else
+                {
+                    if (!RestoreCookSession(cookSnapshot, out cookSkipReason))
+                        LogCookResumeSkipped(cookSkipReason ?? "snapshot validation failed", cookSnapshot.CapturedAtGameHours, cookSnapshot.CookActive, cookSnapshot.CookSessionStartGameHours, cookSnapshot.CookBatchesLeft, cookSnapshot.CookShiftHours, cookSnapshot.NextCookAtGameHours);
+                    // Independently rebind saved-world references from the same validated save.
+                    // This only fills managed lists. No interactable is created, moved or deleted.
+                    RestoreWorldTracking(cookSnapshot);
+                    RestoreCrewProgress(cookSnapshot);
+                    RestoreLabDiscoveryTracking(cookSnapshot);
+                    RestoreLabStage(cookSnapshot);
+                    RestoreOverdoseTracking(cookSnapshot);
+                }
+                Log($"[resume] recovered {DrugName} (key={saved.DrugKey}), cook {NarcoticsPlugin.Name(cook)}, " +
+                    $"{Distributors.Count} distributor(s), {Dealers.Count} original dead drop(s). " +
+                    $"rebound {reboundInventory} held dose(s); bins resynced from saved pages. " +
+                    "Transient jobs reset; saved cook and overdose state restored where available.");
+                return true;
+            }
+            catch (Exception e) { Log($"RestoreIdentity failed: {e}"); return false; }
         }
 
         internal static void ResetOnLoad() { ClearState(); ResetFilmSpots(); _lastOpEndGT = 0f; _nextAutoStartTry = 0f; EnsureVanillaLoopOnLoad(); }
@@ -368,7 +590,8 @@ namespace Narcotics
             Distributors.Clear(); Dealers.Clear(); Buyers.Clear(); LabStash.Clear();
             _forceSale = false; _nextSellScan = 0f;
             _odBuyerId = -1; _odAtHours = 0f; _odNextEligible = 0f; _odQueue.Clear();
-            _cookActive = false; _cookBatchesLeft = 0; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _cookPotter = null; _cookNextPotter = 0f;
+            _resumeCookTravelTrace = false; _resumeCookTravelLogAfter = 0f;
+            _cookActive = false; _cookSessionStart = -1f; _cookBatchesLeft = 0; _cookBatchLimit = 0; _nextCookTime = 0f; _cookShiftHours = 0f; _cookIntervalHours = 0f; _labDressed = false; _labDressTries = 0; _labFurniture.Clear(); _labDosesPlaced = false; _labDiscoveryDoses.Clear(); _labDiscoveryOriginalPlaces.Clear(); _labDiscoveryNeedsExactRestore = false; _labDiscoveryVisualPassPending = false; _cookPotter = null; _cookNextPotter = 0f;
             _buyerDealer.Clear(); _buyerSpot.Clear(); _nextSightingReinforce = 0f;
             ResetJob();
             try { Herd.ReleaseAll(); } catch { }
@@ -412,6 +635,7 @@ namespace Narcotics
             try
             {
                 if (Active || !NarcoticsConfig.Enable) return;
+                if (InvestigationPersistence.Loading || InvestigationPersistence.HasUnresolvedCase()) return;
                 if (NarcoticsConfig.HijackChance < 0.999f) return;   // share mode -> rely on the hijack, not a proactive start
                 if (Time.time < _nextAutoStartTry) return;
                 _nextAutoStartTry = Time.time + 10f;                 // retry cadence until the city is ready + Start succeeds
@@ -427,8 +651,26 @@ namespace Narcotics
                 {
                     if (InCaseGap()) return;   // still within the game's murder interval since the last case
                     bool loopOn = false; try { var mc = MurderController.Instance; loopOn = mc != null && mc.procGenLoopActive; } catch { }
-                    if (loopOn) return;   // past the gap: the hijack replaces the game's next scheduled murder; no proactive restart
-                    // else loop stuck off -> fall through and proactively restart (safety net so the chain never dies)
+                    if (loopOn)
+                    {
+                        // Normally the next ExecuteNewMurder callback replaces the vanilla case. Some scheduler mods
+                        // can leave the loop enabled but never issue that callback (the observed ConfigurableMurderCooldown
+                        // case). After one expected murder interval plus a short grace, recover only if the game has no
+                        // active murder left. This avoids leaving narcotics-only runs waiting forever while preserving
+                        // a legitimate vanilla case if one is already underway.
+                        float now = Herd.NowHours();
+                        float fallbackAt = Math.Max(NextGridPoint(_lastOpEndGT), _lastOpEndGT + GameMurderIntervalHours() + 6f);
+                        if (now < fallbackAt) return;
+                        int activeMurders = -1;
+                        try { var mc = MurderController.Instance; activeMurders = mc != null && mc.activeMurders != null ? mc.activeMurders.Count : -1; } catch { }
+                        if (activeMurders != 0) return;
+                        if (Math.Abs(_stalledSchedulerLoggedForEndGT - _lastOpEndGT) > 0.01f)
+                        {
+                            _stalledSchedulerLoggedForEndGT = _lastOpEndGT;
+                            Log($"[auto] vanilla murder callback stalled; no active murders {now - _lastOpEndGT:0.0}h after case end (fallback threshold {fallbackAt - _lastOpEndGT:0.0}h). Starting the next narcotics case.");
+                        }
+                    }
+                    // Loop off, or its callback stayed absent past the bounded fallback: start/retry below.
                 }
                 if (Start()) Log("[auto] narcotics auto-started (bootstrap; subsequent cases follow the vanilla murder cadence via the hijack).");
             }
@@ -442,6 +684,8 @@ namespace Narcotics
             {
                 TickOverdose();                        // fire a scheduled buyer overdose -> arrest -> case
                 TickDressLab();                        // place lab equipment once the lab geometry streams (player visits)
+                RestoreExactLabDiscoveryPlacements();  // reconnect original furniture slots, NEVER choose a new spot
+                RestoreLabDiscoveryVisuals();            // native visual for the SAME saved Interactable, at exact saved transform
                 TickLabDoses();                        // seed a few discoverable doses in the lab (evidence, not supply)
                 TickReinforceSightings();              // keep buyers' dealer sightings fresh so interrogation works
                 if (TickCaseResolution()) return;      // player solved the case -> stand down + wipe this tick
@@ -724,37 +968,52 @@ namespace Narcotics
             try
             {
                 if (CookHuman == null || Lab == null) return;
+                // Do not re-pin a cook already in an arrest flow.
+                try { if (Arrest.IsArrestee(CookHuman.humanID)) { TraceResumedCookTravel("cook-in-arrest", null); Herd.Release(CookHuman); return; } } catch { }
+                // End an expired restored shift before navigation or batch production.
+                if (FinishCookShiftIfExpired(Herd.NowHours())) return;
                 // If the player has ARRESTED the cook (restrained), stop driving them to the lab - they shouldn't keep
                 // trying to cook while cuffed. Release the pin and let the arrest play out.
-                try { var cai = CookHuman.ai; if (cai != null && cai.restrained) { try { Herd.Release(CookHuman); } catch { } return; } } catch { }
+                try { var cai = CookHuman.ai; if (cai != null && cai.restrained) { TraceResumedCookTravel("cook-restrained", null); try { Herd.Release(CookHuman); } catch { } return; } } catch { }
                 if (!_cookActive)
                 {
                     if (Herd.NowHours() < _nextCookTime) return;   // between shifts - the cook lives its normal life
                     _cookActive = true;
                     _cookSessionStart = -1f;   // the shift clock starts when the cook ARRIVES at the lab (set below), NOT at dispatch, so the walk over doesn't eat into the stakeout window
-                    _cookBatchesLeft = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);   // CEILING for this shift (not a requirement)
-                    Log($"cook heading to the lab for a {NarcoticsConfig.CookShiftHours:0.#}h shift: up to {_cookBatchesLeft} dose(s) ON DEMAND (made only when the dealer runs dry); the shift clock starts when they arrive.");
+                    _cookShiftHours = Math.Max(0.1f, NarcoticsConfig.CookShiftHours);
+                    _cookBatchLimit = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
+                    _cookBatchesLeft = _cookBatchLimit;   // CEILING for this shift (not a requirement)
+                    Log($"cook heading to the lab for a {_cookShiftHours:0.#}h shift: up to {_cookBatchesLeft} dose(s) ON DEMAND (made only when the dealer runs dry); the shift clock starts when they arrive.");
                 }
 
                 // If the cook is reacting to a tail (confront/flee), GET OUT OF THE WAY: release the lab pin so the vanilla
                 // reaction plays cleanly, instead of the pin fighting it (that caused the cook to repeat the warning bark
                 // on the spot). It re-pins and walks back to the lab once calm; batch timing is game-hours based, so a
                 // brief interruption is harmless.
-                if (Herd.IsReacting(CookHuman)) { try { Herd.Release(CookHuman); } catch { } return; }
+                if (Herd.IsReacting(CookHuman)) { TraceResumedCookTravel("cook-reacting", null); try { Herd.Release(CookHuman); } catch { } return; }
 
                 var node = LabNode(CookHuman);
-                if (node == null) return;                          // lab not streamed yet
-                // POTTER within the lab instead of standing frozen on one node (which could be inside the furniture):
-                // rotate among nearby lab nodes every ~12-20s and play the hands-busy gesture so the cook paces while
-                // looking like they're working. The cook is "at the lab" whenever they're on any of these nodes.
-                if (_cookPotter == null || Time.time >= _cookNextPotter)
+                if (node == null)
+                {
+                    TraceResumedCookTravel("lab-node-unavailable", null);
+                    return; // never teleport a cook or guess a substitute location
+                }
+                // While the cook is en route, the target must remain STABLE. Rotating
+                // _cookPotter every 6-12 real seconds previously replaced the AI goal
+                // before doors/pathfinding could complete. After first arrival, the
+                // ordinary in-lab pottering cadence resumes.
+                if (_cookPotter == null || (_cookSessionStart >= 0f && Time.time >= _cookNextPotter))
                 {
                     _cookPotter = LabPotterNode(node) ?? node;
                     _cookNextPotter = Time.time + 6f + (float)_rng.NextDouble() * 6f;
                 }
                 _targetNode = _cookPotter;
                 ArmLabDoorClose(CookHuman);                                    // vanilla: cook shuts the lab door on their way out
-                if (!Herd.ToNode(CookHuman, _cookPotter, Lab, 1.2f)) return;   // walk to the current potter node, then do lab work
+                if (!Herd.ToNode(CookHuman, _cookPotter, Lab, 1.2f))
+                {
+                    TraceResumedCookTravel("en-route", _cookPotter);
+                    return;
+                }
                 try { Anim.Locking(CookHuman); } catch { }                     // hands-busy "cooking" gesture
 
                 // First tick the cook actually REACHES the lab this shift, start the CookShiftHours clock HERE (not at
@@ -764,7 +1023,8 @@ namespace Narcotics
                 if (_cookSessionStart < 0f)
                 {
                     _cookSessionStart = Herd.NowHours();
-                    Log($"cook arrived at the lab; {NarcoticsConfig.CookShiftHours:0.#}h shift starts now.");
+                    _resumeCookTravelTrace = false;
+                    Log($"cook arrived at the lab; {_cookShiftHours:0.#}h shift starts now.");
                 }
 
                 // Place any doses still in hand from the batch just made (spans a few ticks).
@@ -780,33 +1040,710 @@ namespace Narcotics
                 // Keyed to the DEALER - not the whole pipeline - so a dose still in transit (with the distributor) can't
                 // stall the restock; that was the day-2 bug (dealer empty but a dose sat in transit, so PipelineDry never
                 // went true and the cook never cooked). Demand-pull pacing is preserved via the lab-stash-empty gate.
+                // Guard immediately before production so an expired shift cannot gain a reload-time batch.
+                if (FinishCookShiftIfExpired(Herd.NowHours())) return;
                 bool makeNext = _cookBatchesLeft > 0 && DealerDry() && LabStashCount() <= 0;
                 if (makeNext)
                 {
                     Dose.CreateMany(CookHuman, Math.Max(1, NarcoticsConfig.CookStashCap));
                     _cookBatchesLeft--;
-                    int total = Math.Max(1, NarcoticsConfig.CookBatchesPerSession);
+                    int total = Math.Max(1, _cookBatchLimit);
                     Log($"cook made dose {total - _cookBatchesLeft}/{total}{(_cookBatchesLeft > 0 ? " - next after the dealer runs out again" : " (last of the day)")}.");
                     return;   // next ticks place the dose
                 }
 
-                // The cook stays at the lab for the WHOLE shift (CookShiftHours), then goes home - REGARDLESS of how many
-                // doses were made (6 is a ceiling, not a requirement). So the lab is a reliable stakeout window instead of
-                // the cook leaving the moment the day's doses are done. The NEXT shift is on the 12h grid anchored to case
-                // init (opStart + 12h, +24h, ...), mirroring the vanilla serial-killer re-strike; the arrested check at the
-                // top stops it once the cook is cuffed.
-                if (_cookSessionStart >= 0f && Herd.NowHours() >= _cookSessionStart + Math.Max(0.1f, NarcoticsConfig.CookShiftHours))
-                {
-                    _cookActive = false;
-                    float nowH = Herd.NowHours();
-                    _nextCookTime = NextGridPoint(nowH);   // next 12h grid boundary from case init (skips any passed while this shift ran)
-                    try { Herd.Release(CookHuman); } catch { }
-                    int madeThis = Math.Max(1, NarcoticsConfig.CookBatchesPerSession) - _cookBatchesLeft;
-                    Log($"cook's shift ended (made {madeThis} dose(s)); going home. Returns to the lab at case-init + {((_nextCookTime - _opStartGT)):0.#}h (in {(_nextCookTime - nowH):0.#}h) unless arrested.");
-                }
-                // else: still on shift - cook stays pinned at the lab (Herd.ToNode holds them), cooking when the dealer runs dry.
+                // A valid shift remains pinned to the lab until its saved deadline.
             }
             catch (Exception e) { Log($"TickCook error: {e.Message}"); }
+        }
+
+        internal static SavedCookSession CaptureCookSession()
+        {
+            try
+            {
+                if (!Active || CookHuman == null || Lab == null || string.IsNullOrEmpty(DrugItem.CurrentKey)) return null;
+                if (!int.TryParse(LabDirIndex(), out int labIndex)) return null;
+                var snapshot = new SavedCookSession
+                {
+                    DrugKey = DrugItem.CurrentKey,
+                    CaseTitle = CaseTitle,
+                    CookHumanId = CookHuman.humanID,
+                    LabDirectoryIndex = labIndex,
+                    CapturedAtGameHours = Herd.NowHours(),
+                    OperationStartedAtGameHours = _opStartGT,
+                    CookActive = _cookActive,
+                    CookSessionStartGameHours = _cookSessionStart,
+                    CookShiftHours = Math.Max(0.1f, _cookShiftHours > 0f ? _cookShiftHours : NarcoticsConfig.CookShiftHours),
+                    CookBatchesLeft = Math.Max(0, _cookBatchesLeft),
+                    CookBatchLimit = Math.Max(1, _cookBatchLimit > 0 ? _cookBatchLimit : NarcoticsConfig.CookBatchesPerSession),
+                    NextCookAtGameHours = _nextCookTime,
+                    CookIntervalHours = Math.Max(0.1f, _cookIntervalHours > 0f ? _cookIntervalHours : NarcoticsConfig.CookIntervalHours)
+                };
+
+                // Capture only references already tracked in this live operation.
+                // Buyers are sales history; an item may have been seized since their purchase.
+                var buyerIds = new HashSet<int>();
+                for (int i = 0; i < Buyers.Count; i++)
+                {
+                    try
+                    {
+                        var buyer = Buyers[i];
+                        if (buyer != null && buyer.humanID >= 0 && buyerIds.Add(buyer.humanID))
+                            snapshot.BuyerHumanIds.Add(buyer.humanID);
+                    }
+                    catch { }
+                }
+                var supplyIds = new HashSet<int>();
+                for (int i = 0; i < LabStash.Count; i++)
+                {
+                    try
+                    {
+                        var item = LabStash[i];
+                        if (IsWorldLabSupply(item, snapshot.DrugKey) && supplyIds.Add(item.id))
+                            snapshot.LabStashInteractableIds.Add(item.id);
+                    }
+                    catch { }
+                }
+                // Preserve the first overdose even if the operation has not opened a case.
+                // Captured before native SaveState serialization begins, so the saved
+                // operation timeline matches the native game save.
+                snapshot.HasLabStageTracking = true;
+                snapshot.LabWasDressed = _labDressed;
+                snapshot.LabDosesWereSeeded = _labDosesPlaced;
+                snapshot.HasCaseOpenState = true;
+                snapshot.CaseWasOpen = NarcCase.IsOpen;
+                snapshot.HasOverdoseTracking = true;
+                snapshot.PendingOverdoseBuyerId = _odBuyerId;
+                snapshot.PendingOverdoseAtGameHours = _odAtHours;
+                snapshot.NextOverdoseEligibleAtGameHours = _odNextEligible;
+                snapshot.QueuedOverdoseBuyerIds.AddRange(_odQueue);
+                if (!snapshot.CaseWasOpen && Arrest.Active && Arrest.Subject != null)
+                {
+                    int arrestId = SafeId(Arrest.Subject);
+                    if (arrestId >= 0 && buyerIds.Contains(arrestId))
+                        snapshot.PreCaseApproachingBuyerId = arrestId;
+                }
+                snapshot.HasCrewProgressTracking = true;
+                foreach (var dist in Distributors)
+                    if (dist != null && dist.H != null && dist.H.humanID >= 0)
+                        snapshot.DistributorProgress.Add(new SavedDistributorProgress { HumanId = dist.H.humanID, Collected = dist.Collected });
+                snapshot.HasDealerCooldownTracking = true;
+                foreach (var dealer in Dealers)
+                    if (dealer != null && dealer.H != null && dealer.H.humanID >= 0 && FiniteCookValue(dealer.NextSell) && dealer.NextSell >= 0f)
+                        snapshot.DealerCooldowns.Add(new SavedDealerCooldown { HumanId = dealer.H.humanID, NextSellAtGameHours = dealer.NextSell });
+                Log($"[crew-save] distributors={snapshot.DistributorProgress.Count} dealerCooldowns={snapshot.DealerCooldowns.Count}.");
+                snapshot.HasWorldTracking = true;
+                snapshot.HasLabDiscoveryTracking = true;
+                snapshot.LabDiscoveryWasSeeded = _labDosesPlaced;
+                var evidenceIds = new HashSet<int>();
+                for (int i = 0; i < _labDiscoveryDoses.Count; i++)
+                {
+                    try
+                    {
+                        var item = _labDiscoveryDoses[i];
+                        if (!Dose.Alive(item) || item.id <= 0 || item.preset == null ||
+                            !string.Equals(item.preset.presetName, snapshot.DrugKey, StringComparison.Ordinal) ||
+                            !evidenceIds.Add(item.id)) continue;
+                        SavedLabDiscoveryDose savedPlace = null;
+                        // On resaving a restored operation, keep its ORIGINAL pre-load placement
+                        // (not a possibly unstreamed or temporarily detached current wrapper).
+                        for (int j = 0; j < _labDiscoveryOriginalPlaces.Count; j++)
+                            if (_labDiscoveryOriginalPlaces[j].InteractableId == item.id)
+                            { savedPlace = _labDiscoveryOriginalPlaces[j]; break; }
+                        if (savedPlace == null) savedPlace = CaptureLabDiscoveryPlace(item);
+                        if (savedPlace != null) snapshot.LabDiscoveryDoses.Add(savedPlace);
+                    }
+                    catch (Exception e) { Log($"[lab-evidence-save] item skipped: {e.Message}"); }
+                }
+                Log($"[lab-evidence-save] seeded={snapshot.LabDiscoveryWasSeeded} originalPlaces={snapshot.LabDiscoveryDoses.Count} " +
+                    $"ids=[{string.Join(",", snapshot.LabDiscoveryDoses.ConvertAll(p => p.InteractableId))}]; exact positions and furniture signatures captured.");
+                Log($"[world-save] captured buyers={snapshot.BuyerHumanIds.Count} labStash={snapshot.LabStashInteractableIds.Count} (IDs only).");
+                return snapshot;
+            }
+            catch (Exception e) { Log($"[cook-save] state capture failed: {e.Message}"); return null; }
+        }
+
+        // Restore these non-authoritative flags only for the save-matched snapshot.
+        // Physical stock remains authoritative; the timer controls when existing stock may sell.
+        private static void RestoreCrewProgress(SavedCookSession saved)
+        {
+            if (saved == null) return;
+            int distributorsRestored = 0, cooldownsRestored = 0;
+            if (saved.HasCrewProgressTracking && saved.DistributorProgress != null && saved.DistributorProgress.Count <= Distributors.Count)
+            {
+                var seen = new HashSet<int>();
+                foreach (var progress in saved.DistributorProgress)
+                {
+                    if (progress == null || progress.HumanId < 0 || !seen.Add(progress.HumanId)) continue;
+                    var dist = Distributors.Find(d => d != null && d.H != null && d.H.humanID == progress.HumanId);
+                    if (dist == null) continue;
+                    dist.Collected = progress.Collected;
+                    distributorsRestored++;
+                }
+            }
+            if (saved.HasDealerCooldownTracking && saved.DealerCooldowns != null && saved.DealerCooldowns.Count <= Dealers.Count)
+            {
+                var seen = new HashSet<int>();
+                foreach (var cooldown in saved.DealerCooldowns)
+                {
+                    if (cooldown == null || cooldown.HumanId < 0 || !seen.Add(cooldown.HumanId) ||
+                        !FiniteCookValue(cooldown.NextSellAtGameHours) || cooldown.NextSellAtGameHours < 0f) continue;
+                    var dealer = Dealers.Find(d => d != null && d.H != null && d.H.humanID == cooldown.HumanId);
+                    if (dealer == null) continue;
+                    dealer.NextSell = cooldown.NextSellAtGameHours;
+                    cooldownsRestored++;
+                }
+            }
+            Log($"[crew-resume] distributorProgress={distributorsRestored}/{Distributors.Count} dealerCooldowns={cooldownsRestored}/{Dealers.Count}; physical stock unchanged.");
+        }
+
+        // An operation saved before the player ever visited the lab must still
+        // dress that lab and seed the four evidence doses when geometry streams.
+        private static void RestoreLabStage(SavedCookSession saved)
+        {
+            if (saved == null || !saved.HasLabStageTracking) return;
+            if (!saved.LabWasDressed)
+            {
+                _labDressed = false;
+                _nextDressTry = 0f;
+                _labDressTries = 0;
+                _labFurniture.Clear();
+            }
+            if (!saved.LabDosesWereSeeded) _labDosesPlaced = false;
+            Log($"[lab-stage-resume] dressed={_labDressed} evidenceSeeded={_labDosesPlaced}; " +
+                "pre-first-visit saves may finish dressing on lab entry.");
+        }
+
+        // Buyer identity has already been rebound from this precise native save.
+        // Overdoses remain scheduled for their original game-time, never replay sales.
+        private static void RestoreOverdoseTracking(SavedCookSession saved)
+        {
+            if (saved == null || !saved.HasOverdoseTracking) return;
+            try
+            {
+                _odBuyerId = -1;
+                _odAtHours = 0f;
+                _odQueue.Clear();
+                float now = Herd.NowHours();
+                _odNextEligible = !float.IsNaN(saved.NextOverdoseEligibleAtGameHours) &&
+                    !float.IsInfinity(saved.NextOverdoseEligibleAtGameHours)
+                    ? saved.NextOverdoseEligibleAtGameHours : now;
+                var known = new HashSet<int>();
+                foreach (var buyer in Buyers)
+                    if (buyer != null) known.Add(buyer.humanID);
+                int due = saved.PendingOverdoseBuyerId;
+                if (known.Contains(due) && !float.IsNaN(saved.PendingOverdoseAtGameHours) &&
+                    !float.IsInfinity(saved.PendingOverdoseAtGameHours))
+                {
+                    _odBuyerId = due;
+                    _odAtHours = saved.PendingOverdoseAtGameHours;
+                }
+                else if (!saved.CaseWasOpen && known.Contains(saved.PreCaseApproachingBuyerId))
+                {
+                    // A first overdose already happened but its enforcer hadn't cuffed
+                    // the buyer at save time. Retire the dead arrest machine and resume
+                    // the same buyer's incident once; never manufacture a new sale/dose.
+                    _odBuyerId = saved.PreCaseApproachingBuyerId;
+                    _odAtHours = now + 0.01f;
+                }
+                var unique = new HashSet<int>();
+                foreach (int id in saved.QueuedOverdoseBuyerIds ?? new List<int>())
+                    if (id != _odBuyerId && known.Contains(id) && unique.Add(id)) _odQueue.Add(id);
+                Log($"[od-resume] pending={_odBuyerId} at={_odAtHours:0.###} " +
+                    $"queued={_odQueue.Count} eligible={_odNextEligible:0.###} caseAtSave={saved.CaseWasOpen}; no new items or arrests created.");
+            }
+            catch (Exception e) { Log($"[od-resume] failed: {e.Message}"); }
+        }
+
+        // Identifies ONLY an already-saved, still-unheld world item from this operation.
+        // Reject a known different location; allow missing node information when the lab
+        // geometry has not streamed, since the save-matched item ID remains authoritative.
+        private static bool IsWorldLabSupply(Interactable item, string drugKey)
+        {
+            try
+            {
+                if (!Dose.Alive(item) || item.id < 0 || item.inInventory != null) return false;
+                var preset = item.preset;
+                if (preset == null || !string.Equals(preset.presetName, drugKey, StringComparison.Ordinal)) return false;
+                var node = item.node;
+                var loc = node != null ? node.gameLocation : null;
+                if (loc != null && Lab != null && loc.Pointer != Lab.Pointer) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static void RestoreWorldTracking(SavedCookSession snapshot)
+        {
+            if (snapshot == null || !snapshot.HasWorldTracking) return;  // legacy cook snapshots
+            try
+            {
+                var buyerIds = snapshot.BuyerHumanIds;
+                var stashIds = snapshot.LabStashInteractableIds;
+                if (buyerIds == null || stashIds == null || buyerIds.Count > 1024 || stashIds.Count > 128)
+                {
+                    Log("[world-resume] skipped: missing or oversized snapshot lists.");
+                    return;
+                }
+                int restoredBuyers = 0, restoredStash = 0;
+                var seenBuyers = new HashSet<int>();
+                for (int i = 0; i < buyerIds.Count; i++)
+                {
+                    int id = buyerIds[i];
+                    if (id < 0 || !seenBuyers.Add(id)) continue;
+                    var buyer = ResolveSavedHuman(id);
+                    if (buyer == null) continue;
+                    Buyers.Add(buyer);
+                    restoredBuyers++;
+                }
+
+                var wanted = new HashSet<int>(stashIds);
+                if (wanted.Count > 0)
+                {
+                    var city = CityData.Instance;
+                    var items = city != null ? city.savableInteractableDictionary : null;
+                    if (items != null)
+                    {
+                        foreach (var entry in items)
+                        {
+                            if (wanted.Count == 0) break;
+                            Interactable item = null;
+                            try { item = entry.Value; } catch { }
+                            if (!Dose.Alive(item)) continue;
+                            int id;
+                            try { id = item.id; } catch { continue; }
+                            if (!wanted.Contains(id) || !IsWorldLabSupply(item, snapshot.DrugKey)) continue;
+                            LabStash.Add(item);
+                            wanted.Remove(id);
+                            restoredStash++;
+                        }
+                    }
+                }
+                Log($"[world-resume] buyers={restoredBuyers}/{buyerIds.Count} labStash={restoredStash}/{stashIds.Count}; " +
+                    $"missingOrInvalidStash={wanted.Count}; no items created or moved.");
+            }
+            catch (Exception e) { Log($"[world-resume] failed: {e.Message}"); }
+        }
+
+        // Game PlaceObject chooses a precise furniture sub-object, not merely a nearby
+        // nav node. Save the item's native world transform AND its parent furniture's
+        // exact identity/slot index, so evidence never migrates to another cabinet.
+        private static SavedLabDiscoveryDose CaptureLabDiscoveryPlace(Interactable item)
+        {
+            try
+            {
+                var pos = item.wPos;
+                var rot = item.wEuler;
+                var record = new SavedLabDiscoveryDose
+                {
+                    InteractableId = item.id,
+                    X = pos.x, Y = pos.y, Z = pos.z,
+                    RotX = rot.x, RotY = rot.y, RotZ = rot.z
+                };
+                var parent = item.furnitureParent;
+                if (parent != null && parent.furniture != null)
+                {
+                    var at = Containers.ContainerNode(parent);
+                    if (at != null)
+                    {
+                        var p = at.position;
+                        record.FurnitureName = parent.furniture.name;
+                        record.FurnitureX = p.x; record.FurnitureY = p.y; record.FurnitureZ = p.z;
+                        var spawned = parent.spawnedInteractables;
+                        if (spawned != null)
+                            for (int i = 0; i < spawned.Count; i++)
+                                if (spawned[i] != null && spawned[i].id == item.id)
+                                { record.FurnitureListIndex = i; break; }
+                        if (record.FurnitureListIndex < 0)
+                        {
+                            var integrated = parent.integratedInteractables;
+                            if (integrated != null)
+                                for (int i = 0; i < integrated.Count; i++)
+                                    if (integrated[i] != null && integrated[i].id == item.id)
+                                    { record.FurnitureListIndex = i; record.IntegratedList = true; break; }
+                        }
+                    }
+                }
+                return record;
+            }
+            catch (Exception e) { Log($"[lab-evidence-save] position capture failed: {e.Message}"); return null; }
+        }
+
+        private static void RestoreLabDiscoveryTracking(SavedCookSession snapshot)
+        {
+            if (snapshot == null || !snapshot.HasLabDiscoveryTracking) return;
+            try
+            {
+                var records = snapshot.LabDiscoveryDoses;
+                if (records == null || records.Count > LabDiscoveryDoses)
+                { Log("[lab-evidence-resume] invalid snapshot; refusing to repair or spawn drugs."); return; }
+                var wanted = new HashSet<int>();
+                for (int i = 0; i < records.Count; i++)
+                {
+                    var r = records[i];
+                    if (r == null || r.InteractableId <= 0 || !wanted.Add(r.InteractableId) ||
+                        float.IsNaN(r.X) || float.IsInfinity(r.X) ||
+                        float.IsNaN(r.Y) || float.IsInfinity(r.Y) ||
+                        float.IsNaN(r.Z) || float.IsInfinity(r.Z))
+                    { Log("[lab-evidence-resume] invalid or duplicate evidence placement; leaving world unchanged."); return; }
+                }
+                _labDiscoveryDoses.Clear();
+                _labDiscoveryOriginalPlaces.Clear();
+                _labDiscoveryOriginalPlaces.AddRange(records);
+                _labDosesPlaced = snapshot.LabDiscoveryWasSeeded;
+                var city = CityData.Instance;
+                var items = city != null ? city.savableInteractableDictionary : null;
+                if (items != null)
+                    foreach (var entry in items)
+                    {
+                        var item = entry.Value;
+                        if (!Dose.Alive(item)) continue;
+                        int id;
+                        try { id = item.id; } catch { continue; }
+                        if (!wanted.Contains(id)) continue;
+                        try
+                        {
+                            if (item.preset == null || !string.Equals(item.preset.presetName, snapshot.DrugKey, StringComparison.Ordinal)) continue;
+                            _labDiscoveryDoses.Add(item);
+                            wanted.Remove(id);
+                        }
+                        catch { }
+                    }
+                _labDiscoveryNeedsExactRestore = _labDiscoveryDoses.Count > 0;
+                _labDiscoveryVisualPassPending = _labDiscoveryNeedsExactRestore;
+                // Try before Unity streams the lab's furniture, not only after entry.
+                // Keep the post-stream pass queued for geometry initially unavailable.
+                if (_labDiscoveryNeedsExactRestore) RestoreExactLabDiscoveryPlacements(early: true);
+                Log($"[lab-evidence-resume] originalPlaces={records.Count} found={_labDiscoveryDoses.Count} missing={wanted.Count}; " +
+                    "will reconnect SAME items to their exact furniture, no replacements.");
+            }
+            catch (Exception e) { Log($"[lab-evidence-resume] failed: {e.Message}"); }
+        }
+
+        // Resolve the SAME furnishing by preset + node position, exactly as dealer
+        // dead drops are reconnected. Unlike the old candidate patch, NEVER choose a
+        // random LabPotterNode, use SetAsNotInventory, or create new Interactables.
+        private static FurnitureLocation FindOriginalLabFurniture(SavedLabDiscoveryDose record)
+        {
+            if (Lab == null || record == null || string.IsNullOrEmpty(record.FurnitureName)) return null;
+            FurnitureLocation found = null;
+            var seen = new HashSet<IntPtr>();
+            var candidates = new List<FurnitureLocation>();
+            var rooms = Lab.rooms;
+            if (rooms != null)
+                for (int i = 0; i < rooms.Count; i++)
+                {
+                    var room = rooms[i];
+                    var locations = room != null ? room.individualFurniture : null;
+                    if (locations != null)
+                        for (int j = 0; j < locations.Count; j++) candidates.Add(locations[j]);
+                }
+            var nodes = Lab.nodes;
+            if (nodes != null)
+                for (int i = 0; i < nodes.Count; i++)
+                {
+                    var node = nodes[i];
+                    var locations = node != null ? node.individualFurniture : null;
+                    if (locations != null)
+                        for (int j = 0; j < locations.Count; j++) candidates.Add(locations[j]);
+                }
+            for (int j = 0; j < candidates.Count; j++)
+            {
+                var f = candidates[j];
+                if (f == null || !seen.Add(f.Pointer) || f.furniture == null ||
+                    f.furniture.name != record.FurnitureName) continue;
+                var node = Containers.ContainerNode(f);
+                if (node == null) continue;
+                var pos = node.position;
+                float dx = pos.x - record.FurnitureX, dy = pos.y - record.FurnitureY, dz = pos.z - record.FurnitureZ;
+                if (dx * dx + dy * dy + dz * dz > 0.0025f) continue; // <=5cm: same original fixture
+                if (found != null && found.Pointer != f.Pointer) return null; // ambiguous, do not guess
+                found = f;
+            }
+            return found;
+        }
+
+        // Runs once *after* the lab has streamed. Only repair the original furniture
+        // reference/list entry and native transform of EXISTING objects. If we cannot
+        // identify the same piece of furniture, log and leave the world unchanged.
+        private static void RestoreExactLabDiscoveryPlacements(bool early = false)
+        {
+            if (!_labDiscoveryNeedsExactRestore || (!early && !PlayerInLab())) return;
+            if (!early) _labDiscoveryNeedsExactRestore = false;
+            int intact = 0, repaired = 0, skipped = 0;
+            for (int i = 0; i < _labDiscoveryDoses.Count; i++)
+            {
+                var item = _labDiscoveryDoses[i];
+                try
+                {
+                    if (!Dose.Alive(item) || item.inInventory != null) { skipped++; continue; }
+                    SavedLabDiscoveryDose r = null;
+                    for (int j = 0; j < _labDiscoveryOriginalPlaces.Count; j++)
+                        if (_labDiscoveryOriginalPlaces[j].InteractableId == item.id)
+                        { r = _labDiscoveryOriginalPlaces[j]; break; }
+                    if (r == null) { skipped++; continue; }
+                    var node = item.node;
+                    if (node != null && node.gameLocation != null && node.gameLocation.Pointer != Lab.Pointer)
+                    { skipped++; Log($"[lab-evidence] id={item.id} moved outside lab; unchanged."); continue; }
+                    var original = FindOriginalLabFurniture(r);
+                    if (original == null)
+                    { skipped++; Log($"[lab-evidence] id={item.id} original furniture unresolved; unchanged."); continue; }
+                    // A wrapper can rehydrate with a different pointer to the SAME fixture;
+                    // compare its permanent signature before treating it as moved.
+                    var parent = item.furnitureParent;
+                    if (parent != null && parent.Pointer != original.Pointer)
+                    {
+                        var parentNode = Containers.ContainerNode(parent);
+                        var parentName = parent.furniture != null ? parent.furniture.name : null;
+                        if (parentNode == null || parentName != r.FurnitureName ||
+                            Vector3.Distance(parentNode.position, new Vector3(r.FurnitureX, r.FurnitureY, r.FurnitureZ)) > 0.05f)
+                        { skipped++; Log($"[lab-evidence] id={item.id} now belongs to another fixture; unchanged."); continue; }
+                    }
+                    var list = r.IntegratedList ? original.integratedInteractables : original.spawnedInteractables;
+                    if (list == null)
+                    { skipped++; Log($"[lab-evidence] id={item.id} original furniture list unavailable; unchanged."); continue; }
+                    bool registered = false;
+                    for (int k = 0; k < list.Count; k++)
+                        if (list[k] != null && list[k].id == item.id) { registered = true; break; }
+                    if (parent != null && parent.Pointer == original.Pointer && registered)
+                    { intact++; continue; } // native scene placement is authoritative
+                    if (parent == null || parent.Pointer != original.Pointer) item.furnitureParent = original;
+                    // Reuse exactly the saved object; put it back at its previous list index,
+                    // not a newly chosen slot or node. World transform stays unchanged.
+                    if (!registered)
+                    {
+                        int index = r.FurnitureListIndex;
+                        if (index < 0 || index > list.Count) index = list.Count;
+                        list.Insert(index, item);
+                    }
+                    item.wPos = new Vector3(r.X, r.Y, r.Z);
+                    item.wEuler = new Vector3(r.RotX, r.RotY, r.RotZ);
+                    repaired++;
+                    Log($"[lab-evidence] id={item.id} reattached to ORIGINAL {r.FurnitureName} " +
+                        $"at ({r.X:0.###},{r.Y:0.###},{r.Z:0.###}); original evidence identity intact.");
+                }
+                catch (Exception e) { skipped++; Log($"[lab-evidence] exact attachment error: {e.Message}"); }
+            }
+            Log($"[lab-evidence] exact furniture {(early ? "early" : "in-lab")} check intact={intact} repaired={repaired} skipped={skipped}; " +
+                "no substitute items, relocation, or new supply.");
+        }
+
+        // A reattached Interactable can still lack its Unity GameObject after cold load.
+        // Look for the game's world visual WITHOUT treating evidence registry membership
+        // or FurnitureLocation list membership as proof that a renderer exists.
+        // Reflection keeps this compatible with alternate IL2CPP interop wrapper shapes.
+        private static UnityEngine.Object ExistingLabDiscoveryVisual(Interactable item, out string state)
+        {
+            state = "visual-member-not-found";
+            if (item == null) return null;
+            var flags = System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+            foreach (var memberName in new[] { "controller", "spawnedObject", "spawnedObj", "worldObject" })
+            {
+                try
+                {
+                    object value = null;
+                    var field = typeof(Interactable).GetField(memberName, flags);
+                    if (field != null) value = field.GetValue(item);
+                    else
+                    {
+                        var property = typeof(Interactable).GetProperty(memberName, flags);
+                        if (property == null || property.GetIndexParameters().Length > 0) continue;
+                        value = property.GetValue(item);
+                    }
+                    if (value is UnityEngine.Object unityObject)
+                    {
+                        state = memberName + (unityObject != null ? ":live" : ":missing");
+                        if (unityObject != null) return unityObject;
+                    }
+                    else state = memberName + (value == null ? ":null" : ":non-unity");
+                }
+                catch (Exception e) { state = memberName + ":inspect-failed:" + e.Message; }
+            }
+            return null;
+        }
+
+        // This runs ONCE for the four tracked starter evidence items, after the lab is
+        // streamed and after exact furniture reattachment. SpawnObject is the game's
+        // native visual-instantiation method on the ALREADY-SAVED Interactable; it is
+        // not Toolbox.CreateInteractable or PlaceObject and does not assign a new ID.
+        // The native renderer may be inactive while a closed cabinet hides its contents:
+        // do not SetActive(true), re-home to a convenient node, or create a substitute.
+        private static void RestoreLabDiscoveryVisuals()
+        {
+            if (!_labDiscoveryVisualPassPending || !PlayerInLab()) return;
+            // Never run continuously: retries could create duplicate visual GameObjects.
+            _labDiscoveryVisualPassPending = false;
+            int alreadyLive = 0, spawned = 0, failed = 0, skipped = 0;
+            for (int i = 0; i < _labDiscoveryDoses.Count; i++)
+            {
+                var item = _labDiscoveryDoses[i];
+                try
+                {
+                    if (!Dose.Alive(item) || item.inInventory != null) { skipped++; continue; }
+                    SavedLabDiscoveryDose saved = null;
+                    for (int j = 0; j < _labDiscoveryOriginalPlaces.Count; j++)
+                        if (_labDiscoveryOriginalPlaces[j].InteractableId == item.id)
+                        { saved = _labDiscoveryOriginalPlaces[j]; break; }
+                    if (saved == null) { skipped++; continue; }
+                    var original = FindOriginalLabFurniture(saved);
+                    if (original == null || item.furnitureParent == null ||
+                        original.Pointer != item.furnitureParent.Pointer)
+                    { skipped++; Log($"[lab-evidence-visual] id={item.id} exact original furniture not attached; no spawn."); continue; }
+                    var at = item.node;
+                    if (at != null && at.gameLocation != null && at.gameLocation.Pointer != Lab.Pointer)
+                    { skipped++; Log($"[lab-evidence-visual] id={item.id} moved outside lab; no spawn."); continue; }
+                    var visual = ExistingLabDiscoveryVisual(item, out var before);
+                    if (visual != null)
+                    {
+                        alreadyLive++;
+                        Log($"[lab-evidence-visual] id={item.id} existing Unity object ({before}); left unchanged.");
+                        continue;
+                    }
+
+                    int originalId = item.id;
+                    // The authoritative coordinates are the EXACT original placement,
+                    // not the player's location or an arbitrary lab node.
+                    item.wPos = new Vector3(saved.X, saved.Y, saved.Z);
+                    item.wEuler = new Vector3(saved.RotX, saved.RotY, saved.RotZ);
+                    bool nativeFlag = false;
+                    item.SpawnObject(out nativeFlag);
+                    var afterVisual = ExistingLabDiscoveryVisual(item, out var after);
+                    if (item.id != originalId)
+                    {
+                        failed++;
+                        Log($"[lab-evidence-visual] ERROR: original ID changed {originalId}->{item.id} during SpawnObject; investigate.");
+                    }
+                    else if (afterVisual != null)
+                    {
+                        // Native spawning normally reads wPos/wEuler. Force the SAME
+                        // original world transform on the newly materialized visual.
+                        Transform transform = null;
+                        if (afterVisual is Component component) transform = component.transform;
+                        else if (afterVisual is GameObject gameObject) transform = gameObject.transform;
+                        if (transform != null)
+                        {
+                            transform.position = new Vector3(saved.X, saved.Y, saved.Z);
+                            transform.eulerAngles = new Vector3(saved.RotX, saved.RotY, saved.RotZ);
+                        }
+                        spawned++;
+                        Log($"[lab-evidence-visual] id={item.id} native visual spawned; before={before}, after={after}, " +
+                            $"position=({saved.X:0.###},{saved.Y:0.###},{saved.Z:0.###}) ORIGINAL fixture={saved.FurnitureName}.");
+                    }
+                    else
+                    {
+                        failed++;
+                        Log($"[lab-evidence-visual] id={item.id} native SpawnObject returned but no live visual detected; " +
+                            $"before={before}, after={after}, nativeFlag={nativeFlag}. Original item unchanged.");
+                    }
+                }
+                catch (Exception e)
+                {
+                    failed++;
+                    Log($"[lab-evidence-visual] failed to materialize id={(item != null ? item.id : -1)}: {e.Message}");
+                }
+            }
+            Log($"[lab-evidence-visual] in-lab one-shot pass: existing={alreadyLive} spawned={spawned} " +
+                $"failed={failed} skipped={skipped}; same IDs/furniture/original transforms; zero substitute drugs.");
+        }
+
+        private static bool RestoreCookSession(SavedCookSession state, out string reason)
+        {
+            reason = null;
+            float now = Herd.NowHours();
+            if (state == null) { reason = "snapshot missing"; return false; }
+            if (!FiniteCookValue(state.CapturedAtGameHours) || !FiniteCookValue(state.OperationStartedAtGameHours) ||
+                !FiniteCookValue(state.CookSessionStartGameHours) || !FiniteCookValue(state.CookShiftHours) ||
+                !FiniteCookValue(state.NextCookAtGameHours) || !FiniteCookValue(state.CookIntervalHours))
+            { reason = "non-finite game-time value"; return false; }
+            if (state.CookHumanId != (CookHuman != null ? CookHuman.humanID : -1) || state.DrugKey != DrugItem.CurrentKey || state.CaseTitle != CaseTitle)
+            { reason = "restored operation identity mismatch"; return false; }
+            if (Math.Abs(state.OperationStartedAtGameHours - _opStartGT) > 0.05f || Math.Abs(now - state.CapturedAtGameHours) > 0.05f)
+            { reason = $"loaded game time or operation start mismatch (now={now:0.###})"; return false; }
+            if (state.CookShiftHours < 0.1f || state.CookShiftHours > 48f || state.CookIntervalHours < 0.1f || state.CookIntervalHours > 168f ||
+                state.CookBatchLimit < 1 || state.CookBatchLimit > 64 || state.CookBatchesLeft < 0 || state.CookBatchesLeft > state.CookBatchLimit ||
+                state.CookSessionStartGameHours < -1f || state.CookSessionStartGameHours > state.CapturedAtGameHours + 0.05f || state.NextCookAtGameHours < 0f)
+            { reason = "cook snapshot values outside safe bounds"; return false; }
+
+            _opStartGT = state.OperationStartedAtGameHours;
+            _cookIntervalHours = state.CookIntervalHours;
+            _cookShiftHours = state.CookShiftHours;
+            _cookBatchLimit = state.CookBatchLimit;
+            _nextCookTime = state.NextCookAtGameHours;
+            _cookActive = state.CookActive;
+            _cookSessionStart = state.CookSessionStartGameHours;
+            _cookBatchesLeft = state.CookBatchesLeft;
+            // The AI goal is deliberately transient. TickCook rebuilds a safe pin using live nodes and Herd.ToNode.
+            _labNode = null; _cookPotter = null; _cookNextPotter = 0f; _targetNode = null;
+            _resumeCookTravelTrace = _cookActive && _cookSessionStart < 0f;
+            _resumeCookTravelLogAfter = 0f;
+
+            if (_cookActive && _cookSessionStart >= 0f && now >= _cookSessionStart + _cookShiftHours)
+            {
+                FinishCookShiftIfExpired(now);
+                LogCookResumeState(state, now, "saved shift expired; ended once and advanced to the next cadence point");
+                return true;
+            }
+
+            float remaining = _cookActive && _cookSessionStart >= 0f
+                ? Math.Max(0f, _cookSessionStart + _cookShiftHours - now)
+                : (_cookActive ? -1f : _nextCookTime - now);
+            string resumeReason = _cookActive ? (_cookSessionStart < 0f ? "continue travel; shift clock starts on arrival" : "resume original shift")
+                : "between shifts; preserve scheduled start";
+            LogCookResumeState(state, now, resumeReason, remaining);
+            return true;
+        }
+
+        // Diagnostic-only heartbeat for a saved cook who was travelling when saved.
+        // No item creation, movement, timing changes or AI goal modifications here.
+        private static void TraceResumedCookTravel(string stage, NewNode target)
+        {
+            if (!_resumeCookTravelTrace || Time.time < _resumeCookTravelLogAfter) return;
+            _resumeCookTravelLogAfter = Time.time + 15f;
+            try
+            {
+                var current = CookHuman != null ? CookHuman.currentNode : null;
+                var ai = CookHuman != null ? CookHuman.ai : null;
+                bool hasGoal = false;
+                try { hasGoal = ai != null && ai.currentGoal != null; } catch { }
+                float distance = -1f;
+                try { if (current != null && target != null) distance = Vector3.Distance(current.position, target.position); } catch { }
+                Log($"[cook-resume-travel] stage={stage} cook={NarcoticsPlugin.Name(CookHuman)} " +
+                    $"gameTime={Herd.NowHours():0.###} target={(target != null ? "present" : "missing")} " +
+                    $"currentNode={(current != null ? "present" : "missing")} ai={(ai != null ? "present" : "missing")} " +
+                    $"goal={(hasGoal ? "present" : "missing")} distanceM={distance:0.##}; waiting for ORIGINAL cook to reach ORIGINAL lab.");
+            }
+            catch (Exception e) { Log($"[cook-resume-travel] diagnostics unavailable: {e.Message}"); }
+        }
+
+        private static bool FinishCookShiftIfExpired(float nowHours)
+        {
+            if (!_cookActive || _cookSessionStart < 0f || nowHours < _cookSessionStart + Math.Max(0.1f, _cookShiftHours)) return false;
+            int madeThis = Math.Max(0, _cookBatchLimit - _cookBatchesLeft);
+            _cookActive = false;
+            _cookBatchesLeft = 0;
+            _cookSessionStart = -1f;
+            _nextCookTime = NextGridPoint(nowHours);
+            try { if (CookHuman != null) Herd.Release(CookHuman); } catch { }
+            Log($"cook shift ended once (made {madeThis} dose(s)); next legitimate shift at {_nextCookTime:0.###} GT.");
+            return true;
+        }
+
+        private static bool FiniteCookValue(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
+        private static void LogCookResumeSkipped(string reason, float savedAt, bool active = false, float started = -1f, int batchesLeft = 0, float shiftHours = 0f, float nextCookAt = -1f)
+        {
+            float remaining = active && started >= 0f && shiftHours > 0f ? started + shiftHours - Herd.NowHours() : (!active && nextCookAt >= 0f ? nextCookAt - Herd.NowHours() : -1f);
+            Log($"[cook-resume] skipped active={active} started={started:0.###} batchesLeft={batchesLeft} savedGT={savedAt:0.###} remaining={remaining:0.###} reason={reason}.");
+        }
+
+        private static void LogCookResumeState(SavedCookSession state, float now, string reason, float? remaining = null)
+        {
+            float remainingHours = remaining ?? (state.CookActive && state.CookSessionStartGameHours >= 0f
+                ? Math.Max(0f, state.CookSessionStartGameHours + state.CookShiftHours - now)
+                : (state.CookActive ? -1f : state.NextCookAtGameHours - now));
+            Log($"[cook-resume] active={state.CookActive} started={state.CookSessionStartGameHours:0.###} batchesLeft={state.CookBatchesLeft} " +
+                $"savedGT={state.CapturedAtGameHours:0.###} remaining={remainingHours:0.###} reason={reason}.");
         }
 
         // True when NO dose exists anywhere in the pipeline: not in the cook's hand, not in the lab stash, not carried by
@@ -1021,7 +1958,6 @@ namespace Narcotics
                             placed++;
                         }
                         if (_jobDealer.Container != null) _jobDealer.BinDoses = Dose.CountInBin(_jobDealer.Container);   // resync to the LIVE bin (also catches doses the PLAYER took)
-                        _jobDealer.Stocked = true;
                         Log($"DEAD DROP: {NarcoticsPlugin.Name(_jobDist.H)} left x{placed} in {NarcoticsPlugin.Name(_jobDealer.H)}'s {(_jobDealer.Container != null ? "bin" : "spot")} (drop holds {DealerStashCount(_jobDealer)}).");
                         EndJob();
                         break;
@@ -1470,7 +2406,7 @@ namespace Narcotics
                 Human cookToJail = CookHuman;   // capture before Stop() nulls it
                 try { Arrest.Stop(); } catch { }
                 NarcCase.MarkClosed();
-                Stop();   // reverts the lab furniture + releases the crew; sets _lastOpEndGT so InCaseGap holds the next case to the 12h grid
+                Stop(preserveSolvedCaseEvidence: true);   // stop the operation but retain evidence image sources for the solved case
                 // Remove the cook from the world (jailed), like an arrested murderer disappears once the case is solved.
                 try { if (cookToJail != null) { cookToJail.RemoveFromWorld(true); Log($"cook {NarcoticsPlugin.Name(cookToJail)} removed from the world (jailed) on resolution."); } }
                 catch (Exception e) { Log($"cook removal failed: {e.Message}"); }

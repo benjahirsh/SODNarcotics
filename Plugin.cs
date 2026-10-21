@@ -15,7 +15,7 @@ namespace Narcotics
     //
     // This scaffold intentionally ships NO gameplay patches yet: it proves the build,
     // deploy and config pipeline for the new project while the engine is designed.
-    [BepInPlugin(Guid, "Narcotics", "0.2.1")]
+    [BepInPlugin(Guid, "Narcotics", "0.3.0")]
     public class NarcoticsPlugin : BasePlugin
     {
         public const string Guid = "com.opi.narcotics";
@@ -186,7 +186,7 @@ namespace Narcotics
         private void Banner()
         {
             Log.LogInfo("========================================================");
-            Log.LogInfo("==  NARCOTICS MOD  -  v0.2.1 (beta)                    ==");
+            Log.LogInfo("==  NARCOTICS MOD  -  v0.3.0 (beta)                    ==");
             Log.LogInfo("==  If you can read this, the mod is LOADED & ACTIVE.  ==");
             Log.LogInfo("========================================================");
         }

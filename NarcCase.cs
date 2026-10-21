@@ -144,6 +144,8 @@ namespace Narcotics
 
                 int count = -1; try { count = cpc.activeCases != null ? cpc.activeCases.Count : -1; } catch { }
                 Log($"OPENED custom case '{SafeName(c)}' for {NarcoticsPlugin.Name(subject)} (activeCases={count}). Open the case board - it is selected, no popup.");
+                // Persist the immutable crew, lab and dead-drop identities once there is a real case.
+                try { InvestigationPersistence.RecordOpenedCase(); } catch { }
                 return true;
             }
             catch (Exception e) { Log($"Open error: {e}"); return false; }
@@ -643,6 +645,19 @@ namespace Narcotics
                 return ac != null && ac.Pointer == Current.Pointer;
             }
             catch { return false; }
+        }
+
+        // Reconnect to the ACTUAL Case object deserialized by the game. Never create a second Case.
+        // Active leads and arrests will need their own persistence work; a saved case's resolution
+        // questions remain on this original object.
+        internal static void BindLoadedCase(Case saved)
+        {
+            if (saved == null || IsOpen) return;
+            Current = saved;
+            SubjectId = -1;
+            _pendingVerdict = false;
+            _resolvingSelf = false;
+            Log($"rebound existing saved case '{SafeName(saved)}' without creating a duplicate.");
         }
 
         internal static void ResetOnLoad() { Current = null; SubjectId = -1; _pendingVerdict = false; _resolvingSelf = false; try { ResolvedPtrs.Clear(); } catch { } try { _leads.Clear(); } catch { } }

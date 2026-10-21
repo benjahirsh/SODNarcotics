@@ -1,6 +1,6 @@
 {
   "name": "Procedural_Narcotics_Cases",
-  "version_number": "0.2.1",
+  "version_number": "0.3.0",
   "website_url": "https://github.com/benjahirsh/SODNarcotics",
   "description": "[BETA] Expose the supply chain behind mysterious new drugs as they hit the streets. Adds a new case type, inspired by Breaking Bad.",
   "dependencies": [

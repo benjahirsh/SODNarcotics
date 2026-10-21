@@ -205,13 +205,27 @@ namespace Narcotics
 
         // Clone the base into a uniquely named drug preset. Never mutates the shared base. `forceBase` pins a specific
         // base (used by the test key to cycle bases deterministically); otherwise a random pool pick gives per-case variety.
-        internal static InteractablePreset CreateDrug(string presetKey, string displayName, InteractablePreset forceBase = null)
+        // Restore a saved dose without changing the current operation's drug. Loading can call this twice;
+        // re-use existing presets instead of creating another Unity clone for the same key.
+        internal static InteractablePreset CreateDrug(string presetKey, string displayName, InteractablePreset forceBase = null,
+            bool makeCurrent = true, bool persist = true)
         {
             try
             {
+                var dict = Toolbox.Instance != null ? Toolbox.Instance.objectPresetDictionary : null;
+                if (dict == null) { Log("CreateDrug: objectPresetDictionary not ready"); return null; }
+                InteractablePreset existing = null;
+                if (dict.TryGetValue(presetKey, out existing) && existing != null)
+                {
+                    // ResetOnLoad clears the display-name map, so bind it even if this preset already exists.
+                    try { Strings.WriteToDictionary("evidence.names", presetKey, DrugDescription, displayName, "", 0, false, ""); } catch { }
+                    try { _drugNames[existing.Pointer] = displayName; } catch { }
+                    if (makeCurrent) { Current = existing; CurrentKey = presetKey; CurrentDisplay = displayName; BasePreset = forceBase; }
+                    return existing;
+                }
                 var baseP = forceBase ?? PickBase();   // a specific or random drug-item base; random gives per-case photo variety
                 if (baseP == null) { Log("CreateDrug: no base preset found (run the substrate dump to see item names)"); return null; }
-                BasePreset = baseP;
+                if (makeCurrent) BasePreset = baseP;
 
                 var clone = UnityEngine.Object.Instantiate(baseP);
                 if (clone == null) { Log("CreateDrug: Instantiate returned null"); return null; }
@@ -233,13 +247,6 @@ namespace Narcotics
                 try { clone.consumableAmount = 0f; } catch { }
                 try { clone.destroyWhenAllConsumed = false; } catch { }
                 try { clone.takeWith = false; } catch { }
-                // Do NOT persist our doses in save games. A dose uses this RUNTIME-CLONED preset (key 'NarcDrug_<guid>'),
-                // which is not a real registered asset, so the game's save serializer threw a NullReferenceException in
-                // SaveStateController.CaptureSaveStateAsync whenever a dose existed in the world, and reloads reported the
-                // key as missing modded content. The operation state is not persisted across load anyway (ResetOnLoad wipes
-                // it), so excluding our doses from the save is consistent: the case restarts fresh on load instead of
-                // leaving orphaned, unsaveable items. (Belt-and-suspenders: Dose.Create/Place also set Interactable.save=false.)
-                try { clone.dontSaveWithSaveGames = true; } catch (Exception e) { Log($"CreateDrug: set dontSaveWithSaveGames failed: {e.Message}"); }
 
                 // Declassify any WEAPON base (the Syringe is a MurderWeaponPreset, so it offered "attack/throw" instead of
                 // the normal "place/throw"): null the weapon preset so the dose behaves like a regular object, matching the
@@ -260,17 +267,20 @@ namespace Narcotics
                 // change every real beta blocker. So the clone keeps the base's spawnEvidence untouched and the patch swaps
                 // only the displayed text for our dose.
 
-                // Register so lookups and evidence naming resolve to the clone.
-                try { Toolbox.Instance.objectPresetDictionary[presetKey] = clone; } catch (Exception e) { Log($"CreateDrug: register failed: {e.Message}"); }
+                // Register before persisting; a failed registration should not be recorded as a valid drug.
+                try { dict[presetKey] = clone; } catch (Exception e) { Log($"CreateDrug: register failed: {e.Message}"); return null; }
 
                 // Item names resolve via Strings 'evidence.names' keyed by presetName; the 'notes' slot (3rd arg) carries
                 // the examine description. So the dose reads as the case's drug name + "A mysterious new substance".
                 try { Strings.WriteToDictionary("evidence.names", presetKey, DrugDescription, displayName, "", 0, false, ""); }
                 catch (Exception e) { Log($"CreateDrug: WriteToDictionary failed: {e.Message}"); }
 
-                Current = clone; CurrentKey = presetKey; CurrentDisplay = displayName;
+                if (makeCurrent) { Current = clone; CurrentKey = presetKey; CurrentDisplay = displayName; }
                 try { _drugNames[clone.Pointer] = displayName; } catch { }   // register this clone so the card patches recognise its doses + show this name
-                Log($"CreateDrug: created '{displayName}' (key={presetKey}) from base '{SafeName(BasePreset)}'");
+                // Store the exact vanilla base so reloading does not randomly change this drug's appearance.
+                if (persist && presetKey.StartsWith("NarcDrug_", StringComparison.Ordinal))
+                    DrugPersistence.Remember(presetKey, displayName, SafeName(baseP));
+                Log($"CreateDrug: created '{displayName}' (key={presetKey}) from base '{SafeName(baseP)}'");
                 return clone;
             }
             catch (Exception e) { Log($"CreateDrug error: {e}"); return null; }
@@ -288,6 +298,9 @@ namespace Narcotics
                 try { Strings.WriteToDictionary("evidence.names", CurrentKey, DrugDescription, displayName, "", 0, false, ""); }
                 catch (Exception e) { Log($"Rename: WriteToDictionary failed: {e.Message}"); }
                 CurrentDisplay = displayName;
+                // Preserve the final street name if an operation renames the drug after creation.
+                if (BasePreset != null && CurrentKey.StartsWith("NarcDrug_", StringComparison.Ordinal))
+                    DrugPersistence.Remember(CurrentKey, displayName, SafeName(BasePreset));
                 Log($"Rename: current drug is now '{displayName}' (key={CurrentKey}).");
             }
             catch (Exception e) { Log($"Rename error: {e.Message}"); }
